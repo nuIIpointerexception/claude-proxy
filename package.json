@@ -7,7 +7,7 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "setup": "bun src/setup.ts",
-    "prettify:archives": "bun scripts/prettify-archives.ts",
+    "pretty": "bun scripts/prettify-archives.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

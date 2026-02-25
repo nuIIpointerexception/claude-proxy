@@ -1,0 +1,5 @@
+node_modules/
+archives/
+*.log
+.env
+src/index.js

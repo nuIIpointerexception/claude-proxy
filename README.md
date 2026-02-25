@@ -1,34 +1,34 @@
 # claude-intercept
 
-A Bun + TypeScript reverse proxy for Claude Code traffic that forwards requests to the real upstream API while logging structured telemetry.
+A Bun + TypeScript reverse proxy for Claude Code / Anthropic-compatible traffic.
 
-This project is useful when you want to inspect Claude request/response behavior, archive raw payloads, and optionally ship logs to Axiom for querying.
+It sits between Claude Code and the upstream API, forwards requests/responses, and captures structured telemetry plus optional local archives for debugging and analysis.
 
-## What this project does
+## What this project is
 
-`claude-intercept` sits between Claude Code and the upstream Anthropic-compatible endpoint:
+`claude-intercept` is an observability proxy:
 
-1. Claude Code sends requests to this proxy.
-2. The proxy forwards requests to the real upstream.
-3. The proxy streams responses back to Claude Code.
-4. In parallel, it logs request/response metadata and bodies (including SSE streams).
+1. Claude Code sends requests to this local proxy.
+2. The proxy forwards those requests to the configured upstream API.
+3. The proxy streams the upstream response back to Claude Code.
+4. In parallel, it records request/response metadata, payloads, and SSE events.
 
-Core implementation is in `src/index.ts`.
+Main runtime: `src/index.ts`.
 
-## Key features
+## Features
 
-- Auto-discovers upstream from `~/.claude/settings.json` (`env.ANTHROPIC_BASE_URL`) if `UPSTREAM_BASE_URL` is not set.
-- Proxies all methods and paths to upstream.
-- Adds per-request trace ID (`x-request-id`) and structured JSON logs.
-- Captures request insights (model, stream flag, message/tool counts, prompt preview, etc.).
-- Parses and logs Server-Sent Events (SSE), including event counts and token usage when available.
-- Archives request/response artifacts locally under `archives/`.
-- Optional Axiom export with batching, compact event mode, and sampling.
+- Forward-proxy for all methods and paths.
+- Request correlation via per-request `x-request-id`.
+- Header redaction for sensitive headers (for logged metadata).
+- Request insight extraction for Anthropic-style payloads (model, stream flag, tool names/count, message count, prompt preview).
+- SSE parsing + per-event logs + summary/rollup metrics.
+- Optional local artifact archiving under `archives/`.
+- Optional Axiom ingestion with batching and auto-create dataset support.
 
 ## Requirements
 
 - [Bun](https://bun.sh)
-- A Claude Code setup that can point `ANTHROPIC_BASE_URL` to this proxy
+- Claude Code configured to use this proxy as `ANTHROPIC_BASE_URL`
 
 ## Quick start
 
@@ -37,14 +37,12 @@ bun install
 bun run start
 ```
 
-Defaults:
-- Listen host: `127.0.0.1`
-- Listen port: `8787`
-- Proxy URL: `http://127.0.0.1:8787`
+Default listen address:
+- `http://127.0.0.1:8787`
 
-## Configure Claude Code to use the proxy
+## Configure Claude Code
 
-Set your Claude settings so `ANTHROPIC_BASE_URL` points to this proxy:
+Point Claude Code to this proxy:
 
 ```json
 {
@@ -54,32 +52,29 @@ Set your Claude settings so `ANTHROPIC_BASE_URL` points to this proxy:
 }
 ```
 
-Then ensure the proxy knows the real upstream, either:
+Then ensure this proxy knows the real upstream by either:
+- setting `UPSTREAM_BASE_URL`, or
+- running `bun run setup` (captures current upstream automatically when possible).
 
-- via `UPSTREAM_BASE_URL`, or
-- by running setup (see below), which captures your previous upstream automatically.
-
-## Setup helper (automatic configuration)
-
-Run:
+## Setup helper
 
 ```bash
 bun run setup
 ```
 
-What setup does:
-- Reads your Claude settings file (default `~/.claude/settings.json`).
-- Backs it up to `settings.json.backup.<timestamp>`.
-- Sets `ANTHROPIC_BASE_URL` to the proxy base.
-- Preserves your previous upstream as `UPSTREAM_BASE_URL`.
-- Creates/updates local `.env` defaults for this project.
+`src/setup.ts` performs:
+- Read `~/.claude/settings.json` (or `CLAUDE_SETTINGS_PATH`).
+- Backup settings to `settings.json.backup.<timestamp>`.
+- Set `env.ANTHROPIC_BASE_URL` to proxy base.
+- Preserve previous upstream as `UPSTREAM_BASE_URL` when available.
+- Create/update local `.env` defaults.
 
 ## Scripts
 
-- `bun run dev` – run proxy with watch mode
-- `bun run start` – run proxy normally
-- `bun run setup` – rewrite Claude settings and seed `.env`
-- `bun run typecheck` – TypeScript typecheck (`tsc --noEmit`)
+- `bun run dev` — watch mode
+- `bun run start` — start proxy
+- `bun run setup` — rewrite Claude settings + seed `.env`
+- `bun run typecheck` — TypeScript check
 
 ## Environment variables
 
@@ -87,15 +82,14 @@ What setup does:
 
 - `PROXY_HOST` (default: `127.0.0.1`)
 - `PROXY_PORT` (default: `8787`)
-- `UPSTREAM_BASE_URL` (required unless auto-discovered)
+- `UPSTREAM_BASE_URL` (optional if auto-resolved)
 - `CLAUDE_SETTINGS_PATH` (default: `~/.claude/settings.json`)
 
-### Archiving
+### Archiving and payload capture
 
 - `ARCHIVE_ENABLED` (default: `1`)
 - `ARCHIVE_DIR` (default: `<project>/archives`)
 - `BODY_LOG_MAX_BYTES` (default: `65536`)
-- `SSE_LOG_MAX_CHARS` (default: `2000`)
 
 ### Axiom
 
@@ -105,11 +99,11 @@ What setup does:
 - `AXIOM_FLUSH_MS` (default: `1000`)
 - `AXIOM_AUTO_CREATE_DATASET` (default: `1`)
 
-## Logged event types
+## Event flow and outputs
 
-The proxy emits NDJSON-style structured logs to stdout.
+The proxy builds structured events internally and queues them for Axiom when Axiom is configured.
 
-Common `event.action` values:
+Typical event actions include:
 - `proxy_started`
 - `request_received`
 - `request_tool`
@@ -120,57 +114,47 @@ Common `event.action` values:
 - `request_rollup`
 - `proxy_request` (error path)
 
-## Local archive files
+Note: this version primarily exports logs through Axiom queueing. Console output is minimal (startup / error messages).
 
-When archiving is enabled, per-request files are written under `archives/`:
+## Archive files
+
+When `ARCHIVE_ENABLED=1`, request-scoped artifacts are written under `archives/`:
 
 - `<requestId>.request.meta.json`
 - `<requestId>.request.body`
 - `<requestId>.response.meta.json`
 - `<requestId>.response.body` (non-SSE)
 - `<requestId>.response.sse.ndjson` (SSE)
-- `<requestId>.error.txt` (on proxy error)
+- `<requestId>.error.txt` (proxy errors)
 
-## Security and privacy notes
+## Security and privacy
 
-This proxy is intentionally high-visibility and may log sensitive content:
-
-- request/response bodies
-- prompt text previews
-- tool schemas
-- streamed model output in SSE events
+This proxy can capture sensitive data (prompts, model output, tool payloads, headers/metadata). Treat outputs as sensitive.
 
 Recommendations:
-- Treat logs and archives as sensitive data.
 - Keep `.env` private.
-- Add `archives/` to `.gitignore` before using this in repositories you commit.
+- Keep `archives/` out of version control.
+- Use only in environments where traffic inspection is authorized.
 
 ## Troubleshooting
 
-### `No upstream URL found`
+### Error: `No upstream URL found`
 
-Set `UPSTREAM_BASE_URL`, or ensure `~/.claude/settings.json` contains `env.ANTHROPIC_BASE_URL`.
+Set `UPSTREAM_BASE_URL` or ensure Claude settings contain `env.ANTHROPIC_BASE_URL` for auto-resolution.
 
-### Claude requests do not hit proxy
+### Requests are not reaching proxy
 
-Verify Claude is configured with:
-
+Verify Claude is using:
 - `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
 
-### Axiom logs are missing
+### No data in Axiom
 
-Verify both:
-
+Verify:
 - `AXIOM_TOKEN`
 - `AXIOM_DATASET`
 
 ## Project structure
 
-- `src/index.ts` – proxy server, request/response handling, SSE parsing, logging, archiving, Axiom export
-- `src/setup.ts` – one-time setup utility for Claude settings and local `.env`
-- `archives/` – local request artifacts (runtime output)
-
-## Notes
-
-- This repository currently ignores `.env` and `node_modules` via `.gitignore`.
-- Consider also ignoring `archives/` if you do not want captured traffic artifacts tracked by git.
+- `src/index.ts` — proxy runtime, telemetry, SSE parsing, archiving, Axiom batching
+- `src/setup.ts` — one-time settings rewriter and `.env` seeder
+- `archives/` — runtime capture artifacts

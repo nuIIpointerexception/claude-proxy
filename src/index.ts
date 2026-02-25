@@ -302,22 +302,51 @@ async function flushAxiom(): Promise<void> {
 }
 
 function normalizeForAxiom(event: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...event };
+  const action = String(event["event.action"] ?? "");
 
-  delete out["url.path"];
+  const out: Record<string, unknown> = {
+    "@timestamp": event["@timestamp"],
+    "service.name": event["service.name"],
+    "service.version": event["service.version"],
+    "event.dataset": event["event.dataset"],
+    "session.id": event["session.id"],
+    "trace.id": event["trace.id"],
+    "event.action": action,
+    "log.level": event["log.level"],
+    "event.outcome": event["event.outcome"],
+    "latency.ms": event["latency.ms"],
+    "http.response.status_code": event["http.response.status_code"],
+  };
 
-  for (const [key, value] of Object.entries(out)) {
-    if (value === null || value === undefined) {
-      continue;
+  if (action === "request_received") {
+    const body = event["http.request.body"] as { encoding?: string; text?: string; base64?: string } | undefined;
+    out["anthropic.model"] = event["anthropic.model"];
+    out["anthropic.tools.names"] = event["anthropic.tools.names"];
+    out["prompt.preview"] = event["prompt.preview"];
+
+    if (body?.encoding === "utf8" && typeof body.text === "string") {
+      out["request.body"] = truncate(body.text, 12000);
+    } else if (body?.encoding === "base64" && typeof body.base64 === "string") {
+      out["request.body"] = truncate(body.base64, 12000);
     }
+  }
 
-    if (typeof value === "object") {
-      try {
-        out[key] = JSON.stringify(value);
-      } catch {
-        out[key] = String(value);
-      }
+  if (action === "request_tool") {
+    out["tool.name"] = event["tool.name"];
+    out["tool.description"] = event["tool.description"];
+  }
+
+  if (action === "sse_event") {
+    out["sse.event"] = event["sse.event"];
+    if (typeof event["sse.data"] === "string") {
+      out["sse.data"] = truncate(event["sse.data"] as string, 2000);
     }
+  }
+
+  if (action === "request_rollup" || action === "sse_summary") {
+    out["usage.input_tokens"] = event["usage.input_tokens"];
+    out["usage.output_tokens"] = event["usage.output_tokens"];
+    out["sse.event_count"] = event["sse.event_count"];
   }
 
   return out;

@@ -301,12 +301,34 @@ async function flushAxiom(): Promise<void> {
   }
 }
 
+function normalizeForAxiom(event: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...event };
+
+  delete out["url.path"];
+
+  for (const [key, value] of Object.entries(out)) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+
+    if (typeof value === "object") {
+      try {
+        out[key] = JSON.stringify(value);
+      } catch {
+        out[key] = String(value);
+      }
+    }
+  }
+
+  return out;
+}
+
 function queueAxiom(event: Record<string, unknown>): void {
   if (!AXIOM_TOKEN || !AXIOM_DATASET) {
     return;
   }
 
-  axiomQueue.push(event);
+  axiomQueue.push(normalizeForAxiom(event));
   if (axiomQueue.length >= AXIOM_BATCH_SIZE) {
     void flushAxiom();
     return;

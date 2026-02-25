@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname } from "node:path";
 
 const STARTED_AT = Date.now();
 const PROCESS_SESSION_ID = crypto.randomUUID();
@@ -38,7 +39,6 @@ const AXIOM_DATASET = process.env.AXIOM_DATASET;
 const AXIOM_BATCH_SIZE = Number(process.env.AXIOM_BATCH_SIZE ?? 100);
 const AXIOM_FLUSH_MS = Number(process.env.AXIOM_FLUSH_MS ?? 1000);
 const AXIOM_AUTO_CREATE_DATASET = (process.env.AXIOM_AUTO_CREATE_DATASET ?? "1") !== "0";
-const BODY_LOG_MAX_BYTES = Number(process.env.BODY_LOG_MAX_BYTES ?? 65536);
 
 type ClaudeSettings = {
   env?: {
@@ -65,30 +65,17 @@ function decodeBody(bytes: Uint8Array | null, contentType: string): BodyPayload 
     return null;
   }
 
-  const clipped = bytes.byteLength > BODY_LOG_MAX_BYTES ? bytes.slice(0, BODY_LOG_MAX_BYTES) : bytes;
   if (isTextLike(contentType)) {
-    const text = new TextDecoder().decode(clipped);
     return {
       encoding: "utf8",
-      text:
-        bytes.byteLength > BODY_LOG_MAX_BYTES
-          ? `${text}\n...[truncated ${bytes.byteLength - BODY_LOG_MAX_BYTES} bytes]`
-          : text,
+      text: new TextDecoder().decode(bytes),
     };
   }
 
-  const base64 = Buffer.from(clipped).toString("base64");
   return {
     encoding: "base64",
-    base64: bytes.byteLength > BODY_LOG_MAX_BYTES ? `${base64}...[truncated]` : base64,
+    base64: Buffer.from(bytes).toString("base64"),
   };
-}
-
-function truncate(value: string, max = 280): string {
-  if (value.length <= max) {
-    return value;
-  }
-  return `${value.slice(0, max)}…`;
 }
 
 function parsePayloadJson(payload: BodyPayload | null): Record<string, unknown> | null {
@@ -132,7 +119,7 @@ function extractRequestInsights(parsed: Record<string, unknown> | null): Record<
         return (c as Record<string, unknown>).type === "text";
       }) as Record<string, unknown> | undefined;
       if (firstText && typeof firstText.text === "string") {
-        out["prompt.preview"] = truncate(firstText.text.replace(/\s+/g, " "));
+        out["prompt.preview"] = firstText.text.replace(/\s+/g, " ");
       }
     }
   }
@@ -168,8 +155,37 @@ function headersToObject(headers: Headers): Record<string, string> {
   return out;
 }
 
-function requestTarget(url: URL): string {
-  return `${url.pathname}${url.search}`;
+type ArchiveContext = {
+  requestId: string;
+  startedAt: number;
+  method: string;
+  path: string;
+  category: string;
+};
+
+function sanitizePathPart(value: string): string {
+  const out = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return out || "root";
+}
+
+function classifyRequest(pathname: string, parsed: Record<string, unknown> | null): string {
+  if (pathname === "/v1/messages") {
+    return parsed?.stream === true ? "messages-stream" : "messages";
+  }
+  if (pathname === "/v1/messages/count_tokens") {
+    return "count-tokens";
+  }
+  if (pathname.startsWith("/v1/models")) {
+    return "models";
+  }
+  return "other";
+}
+
+function archivePath(context: ArchiveContext, fileName: string): string {
+  const method = sanitizePathPart(context.method);
+  const pathPart = sanitizePathPart(context.path);
+  const baseDir = `${ARCHIVE_DIR}/${context.category}/${method}/${pathPart}`;
+  return `${baseDir}/${context.startedAt}-${context.requestId}.${fileName}`;
 }
 
 async function resolveUpstreamBase(): Promise<string | null> {
@@ -187,11 +203,12 @@ async function resolveUpstreamBase(): Promise<string | null> {
   }
 }
 
-async function archiveWrite(requestId: string, fileName: string, data: string | Uint8Array): Promise<void> {
+async function archiveWrite(context: ArchiveContext, fileName: string, data: string | Uint8Array): Promise<void> {
   if (!ARCHIVE_ENABLED) {
     return;
   }
-  const path = `${ARCHIVE_DIR}/${requestId}.${fileName}`;
+  const path = archivePath(context, fileName);
+  await mkdir(dirname(path), { recursive: true });
   if (typeof data === "string") {
     await writeFile(path, data, "utf8");
     return;
@@ -199,11 +216,12 @@ async function archiveWrite(requestId: string, fileName: string, data: string | 
   await writeFile(path, data);
 }
 
-async function archiveAppend(requestId: string, fileName: string, line: string): Promise<void> {
+async function archiveAppend(context: ArchiveContext, fileName: string, line: string): Promise<void> {
   if (!ARCHIVE_ENABLED) {
     return;
   }
-  const path = `${ARCHIVE_DIR}/${requestId}.${fileName}`;
+  const path = archivePath(context, fileName);
+  await mkdir(dirname(path), { recursive: true });
   await appendFile(path, `${line}\n`, "utf8");
 }
 
@@ -314,39 +332,45 @@ function normalizeForAxiom(event: Record<string, unknown>): Record<string, unkno
     "event.action": action,
     "log.level": event["log.level"],
     "event.outcome": event["event.outcome"],
+    "request.category": event["request.category"],
+    "http.request.method": event["http.request.method"],
+    "url.path": event["url.path"],
     "latency.ms": event["latency.ms"],
     "http.response.status_code": event["http.response.status_code"],
   };
 
   if (action === "request_received") {
-    const body = event["http.request.body"] as { encoding?: string; text?: string; base64?: string } | undefined;
     out["anthropic.model"] = event["anthropic.model"];
     out["anthropic.tools.names"] = event["anthropic.tools.names"];
     out["prompt.preview"] = event["prompt.preview"];
-
-    if (body?.encoding === "utf8" && typeof body.text === "string") {
-      out["request.body"] = truncate(body.text, 12000);
-    } else if (body?.encoding === "base64" && typeof body.base64 === "string") {
-      out["request.body"] = truncate(body.base64, 12000);
-    }
+    out["request.body"] = event["http.request.body"];
   }
 
   if (action === "request_tool") {
     out["tool.name"] = event["tool.name"];
     out["tool.description"] = event["tool.description"];
+    out["tool.input_schema"] = event["tool.input_schema"];
+  }
+
+  if (action === "response_body") {
+    out["http.response.body"] = event["http.response.body"];
+    out["http.response.body.bytes"] = event["http.response.body.bytes"];
+    out["http.response.body.content_type"] = event["http.response.body.content_type"];
   }
 
   if (action === "sse_event") {
     out["sse.event"] = event["sse.event"];
-    if (typeof event["sse.data"] === "string") {
-      out["sse.data"] = truncate(event["sse.data"] as string, 2000);
-    }
+    out["sse.id"] = event["sse.id"];
+    out["sse.data"] = event["sse.data"];
+    out["sse.frame"] = event["sse.frame"];
+    out["sse.data.bytes"] = event["sse.data.bytes"];
   }
 
   if (action === "request_rollup" || action === "sse_summary") {
     out["usage.input_tokens"] = event["usage.input_tokens"];
     out["usage.output_tokens"] = event["usage.output_tokens"];
     out["sse.event_count"] = event["sse.event_count"];
+    out["sse.type_counts"] = event["sse.type_counts"];
   }
 
   return out;
@@ -390,14 +414,25 @@ function toUpstreamUrl(localRequestUrl: string, upstreamOrigin: URL): URL {
   return new URL(`${incoming.pathname}${incoming.search}`, upstreamOrigin);
 }
 
-async function captureResponseBody(inspectStream: ReadableStream<Uint8Array>, requestId: string, contentType: string) {
+async function captureResponseBody(
+  inspectStream: ReadableStream<Uint8Array>,
+  archiveContext: ArchiveContext,
+  requestId: string,
+  contentType: string,
+  category: string,
+  method: string,
+  path: string,
+) {
   const responseBytes = new Uint8Array(await new Response(inspectStream).arrayBuffer());
   const payload = decodeBody(responseBytes, contentType);
-  await archiveWrite(requestId, "response.body", responseBytes);
+  await archiveWrite(archiveContext, "response.body", responseBytes);
   log({
     "log.level": "info",
     "trace.id": requestId,
     "event.action": "response_body",
+    "request.category": category,
+    "http.request.method": method,
+    "url.path": path,
     "http.response.body.bytes": responseBytes.byteLength,
     "http.response.body.content_type": contentType,
     "http.response.body": payload,
@@ -406,8 +441,12 @@ async function captureResponseBody(inspectStream: ReadableStream<Uint8Array>, re
 
 async function captureSSE(
   inspectStream: ReadableStream<Uint8Array>,
+  archiveContext: ArchiveContext,
   requestId: string,
   upstreamUrl: string,
+  category: string,
+  method: string,
+  path: string,
   rollupBase: Record<string, unknown>,
 ) {
   const reader = inspectStream.getReader();
@@ -471,6 +510,9 @@ async function captureSSE(
       const sseEvent = {
         "trace.id": requestId,
         "event.action": "sse_event",
+        "request.category": category,
+        "http.request.method": method,
+        "url.path": path,
         "event.sequence": sequence,
         "url.full": upstreamUrl,
         "sse.event": eventName,
@@ -480,7 +522,7 @@ async function captureSSE(
         "sse.data.bytes": Buffer.byteLength(data, "utf8"),
       };
       log({ "log.level": "info", ...sseEvent });
-      await archiveAppend(requestId, "response.sse.ndjson", JSON.stringify(sseEvent));
+      await archiveAppend(archiveContext, "response.sse.ndjson", JSON.stringify(sseEvent));
     }
   }
 
@@ -534,10 +576,20 @@ Bun.serve({
 
     const requestJson = parsePayloadJson(requestPayload);
     const requestInsights = extractRequestInsights(requestJson);
+    const requestCategory = classifyRequest(upstreamUrl.pathname, requestJson);
+    const archiveContext: ArchiveContext = {
+      requestId,
+      startedAt: Date.now(),
+      method: request.method,
+      path: upstreamUrl.pathname,
+      category: requestCategory,
+    };
+
     const requestMeta = {
       "trace.id": requestId,
       "event.action": "request_received",
       "event.kind": "event",
+      "request.category": requestCategory,
       "http.request.method": request.method,
       "url.full": upstreamUrl.toString(),
       "url.path": upstreamUrl.pathname,
@@ -549,8 +601,8 @@ Bun.serve({
     };
 
     log({ "log.level": "info", ...requestMeta });
-    await archiveWrite(requestId, "request.body", requestBytes ?? new Uint8Array());
-    await archiveWrite(requestId, "request.meta.json", JSON.stringify(requestMeta, null, 2));
+    await archiveWrite(archiveContext, "request.body", requestBytes ?? new Uint8Array());
+    await archiveWrite(archiveContext, "request.meta.json", JSON.stringify(requestMeta, null, 2));
 
     if (requestJson && Array.isArray(requestJson.tools)) {
       for (const [index, rawTool] of requestJson.tools.entries()) {
@@ -562,9 +614,11 @@ Bun.serve({
           "log.level": "info",
           "trace.id": requestId,
           "event.action": "request_tool",
+          "request.category": requestCategory,
+          "http.request.method": request.method,
           "tool.index": index,
           "tool.name": typeof tool.name === "string" ? tool.name : null,
-          "tool.description": typeof tool.description === "string" ? truncate(tool.description, 500) : null,
+          "tool.description": typeof tool.description === "string" ? tool.description : null,
           "tool.input_schema": tool.input_schema,
           "url.path": upstreamUrl.pathname,
           "anthropic.model": requestInsights["anthropic.model"],
@@ -592,6 +646,9 @@ Bun.serve({
         "event.action": "response_headers",
         "event.kind": "event",
         "event.outcome": upstreamResponse.ok ? "success" : "failure",
+        "request.category": requestCategory,
+        "http.request.method": request.method,
+        "url.path": upstreamUrl.pathname,
         "event.duration": Math.round(durationMs * 1_000_000),
         "latency.ms": Math.round(durationMs),
         "latency.bucket": latencyBucket(durationMs),
@@ -606,6 +663,7 @@ Bun.serve({
       const rollupBase = {
         "trace.id": requestId,
         "event.outcome": upstreamResponse.ok ? "success" : "failure",
+        "request.category": requestCategory,
         "latency.ms": Math.round(durationMs),
         "latency.bucket": latencyBucket(durationMs),
         "http.request.method": request.method,
@@ -619,7 +677,7 @@ Bun.serve({
       };
 
       log({ "log.level": "info", ...responseMeta });
-      await archiveWrite(requestId, "response.meta.json", JSON.stringify(responseMeta, null, 2));
+      await archiveWrite(archiveContext, "response.meta.json", JSON.stringify(responseMeta, null, 2));
 
       const body = upstreamResponse.body;
       if (!body) {
@@ -632,9 +690,26 @@ Bun.serve({
 
       const [clientStream, inspectStream] = body.tee();
       if (responseContentType.includes("text/event-stream")) {
-        void captureSSE(inspectStream, requestId, upstreamUrl.toString(), rollupBase);
+        void captureSSE(
+          inspectStream,
+          archiveContext,
+          requestId,
+          upstreamUrl.toString(),
+          requestCategory,
+          request.method,
+          upstreamUrl.pathname,
+          rollupBase,
+        );
       } else {
-        void captureResponseBody(inspectStream, requestId, responseContentType);
+        void captureResponseBody(
+          inspectStream,
+          archiveContext,
+          requestId,
+          responseContentType,
+          requestCategory,
+          request.method,
+          upstreamUrl.pathname,
+        );
         log({
           "log.level": "info",
           "event.action": "request_rollup",
@@ -656,11 +731,13 @@ Bun.serve({
         "event.action": "proxy_request",
         "event.kind": "event",
         "event.outcome": "failure",
+        "request.category": requestCategory,
         "event.duration": Math.round(durationMs * 1_000_000),
         "latency.ms": Math.round(durationMs),
         "latency.bucket": latencyBucket(durationMs),
         "http.request.method": request.method,
         "url.full": upstreamUrl.toString(),
+        "url.path": upstreamUrl.pathname,
         error: errorText,
       });
       log({
@@ -668,13 +745,15 @@ Bun.serve({
         "trace.id": requestId,
         "event.action": "request_rollup",
         "event.outcome": "failure",
+        "request.category": requestCategory,
         "latency.ms": Math.round(durationMs),
         "latency.bucket": latencyBucket(durationMs),
         "http.request.method": request.method,
         "url.full": upstreamUrl.toString(),
+        "url.path": upstreamUrl.pathname,
         error: errorText,
       });
-      await archiveWrite(requestId, "error.txt", errorText);
+      await archiveWrite(archiveContext, "error.txt", errorText);
       return new Response("Bad gateway", { status: 502 });
     }
   },

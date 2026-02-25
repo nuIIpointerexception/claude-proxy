@@ -84,10 +84,6 @@ if (!envMap.has("AXIOM_FLUSH_MS")) {
 if (!envMap.has("AXIOM_AUTO_CREATE_DATASET")) {
   envMap.set("AXIOM_AUTO_CREATE_DATASET", "1");
 }
-if (!envMap.has("BODY_LOG_MAX_BYTES")) {
-  envMap.set("BODY_LOG_MAX_BYTES", "65536");
-}
-
 const ordered = [...envMap.entries()].map(([k, v]) => `${k}=${v}`).join("\n");
 await writeFile(envPath, `${ordered}\n`, "utf8");
 

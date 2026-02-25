@@ -1,5 +1,6 @@
 node_modules/
 archives/
+archives_pretty/
 *.log
 .env
 src/index.js
